@@ -17,14 +17,12 @@ log = logging.getLogger("brain")
 
 ACTIONS = ("settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception")
 
-# Any OpenAI-compatible provider works. Defaults = Google Gemini free tier.
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+# We must use the native Gemini endpoint for the new AQ. API keys
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-LLM_EXTRA = json.loads(os.getenv("LLM_EXTRA", "") or "{}")      # e.g. {"reasoning_effort":"low"}
-LLM_BUDGET = float(os.getenv("LLM_BUDGET_SECONDS", "36"))        # whole request limit is 45 s
-FAKE_LLM = os.getenv("FAKE_LLM") == "1"                          # local protocol testing only
-KEEP_BRACKETS = os.getenv("REF_KEEP_BRACKETS", "1") == "1"       # flip if evidence refs score badly
+LLM_BUDGET = float(os.getenv("LLM_BUDGET_SECONDS", "36"))
+FAKE_LLM = os.getenv("FAKE_LLM") == "1"
+KEEP_BRACKETS = os.getenv("REF_KEEP_BRACKETS", "1") == "1"
 
 
 class BrainError(Exception):
@@ -66,17 +64,13 @@ def _short(v):
 
 
 def flatten(node):
-    """Package JSON -> list of (path, paragraph_text). The model then names a paragraph by id."""
     out = []
-
     def add(path, text):
         text = text.strip()
         if text:
             out.append((path or "package", text))
-
     def sub(p, k):
         return f"{p}.{k}" if p else str(k)
-
     def walk(n, p):
         if isinstance(n, dict):
             meta = [f"{k}: {v}" for k, v in n.items()
@@ -99,7 +93,6 @@ def flatten(node):
                 add(p, chunk)
         elif n is not None:
             add(p, str(n))
-
     walk(node, "")
     return out
 
@@ -115,7 +108,6 @@ def render(n, pkg):
 
 
 def content_key(pkg) -> str:
-    """Cache key = canonical package content, ignoring the package id."""
     body = {k: v for k, v in pkg.items() if k != "packageId"} if isinstance(pkg, dict) else pkg
     return store.sha(body)
 
@@ -148,7 +140,6 @@ def _amount(v):
 
 
 def clean_decision(raw, index):
-    """Validate ONE model decision. Return a clean dict or None (None => ask again)."""
     if not isinstance(raw, dict) or raw.get("action") not in ACTIONS:
         return None
     vendor, inv = raw.get("vendorName"), raw.get("invoiceNumber")
@@ -162,7 +153,7 @@ def clean_decision(raw, index):
     para = index.get(str(raw.get("decisive_para", "")).strip(), "")
     para_tokens = _uniq(BR.findall(para))
     pool = para_tokens or all_tokens
-    if len(para_tokens) == 3:                      # the spec says: exactly three in the decisive paragraph
+    if len(para_tokens) == 3:
         refs = para_tokens
     else:
         said = _uniq(_brk(r) for r in (raw.get("evidence_refs") or []) if isinstance(r, str))
@@ -199,27 +190,37 @@ def _strip_fences(t):
 async def _chat_json(user):
     if not LLM_API_KEY:
         raise BrainError("LLM_API_KEY is not set")
-    import httpx  # imported here so the rest of the file can be tested without it
+    import httpx
 
+    # Native Gemini API endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent"
+    
     deadline, last = time.monotonic() + LLM_BUDGET, "no attempt"
-    body = {"model": LLM_MODEL, "temperature": 0, "max_tokens": 6000,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
-    body.update(LLM_EXTRA)
+    
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generation_config": {"temperature": 0, "maxOutputTokens": 6000, "responseMimeType": "application/json"}
+    }
+    
     for _ in range(3):
         left = deadline - time.monotonic()
         if left < 6:
             break
         try:
             async with httpx.AsyncClient(timeout=left - 2) as c:
-                r = await c.post(f"{LLM_BASE_URL}/chat/completions", json=body,
-                                 headers={"Authorization": f"Bearer {LLM_API_KEY}"})
+                # Use x-goog-api-key header for the new AQ. keys
+                r = await c.post(url, json=body, headers={"x-goog-api-key": LLM_API_KEY})
             if r.status_code in (429, 500, 502, 503, 504):
                 last = f"http {r.status_code}"
                 await asyncio.sleep(1.5)
                 continue
             r.raise_for_status()
-            return json.loads(_strip_fences(r.json()["choices"][0]["message"]["content"]))
+            
+            # Parse native Gemini response format
+            text_content = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(_strip_fences(text_content))
+            
         except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
             last = repr(e)[:200]
             await asyncio.sleep(1)
@@ -227,7 +228,6 @@ async def _chat_json(user):
 
 
 def _fake_raw(n, index):
-    """Stub used only when FAKE_LLM=1 (to test the protocol without spending anything)."""
     pid, text = max(index.items(), key=lambda kv: len(BR.findall(kv[1])))
     return {"package": n, "reason": "Local stub decision for protocol testing.",
             "action": ACTIONS[n % 5], "decisive_para": pid, "evidence_refs": BR.findall(text)[:3],
@@ -265,7 +265,6 @@ async def _ask_model(items, policy_revision):
 
 # ---------------------------------------------------------------- public API
 async def decide(packages, policy_revision=""):
-    """One decision per package, same order. Cached by content; ONE model call for all misses."""
     keys = [content_key(p) for p in packages]
     have = {}
     for k in set(keys):
