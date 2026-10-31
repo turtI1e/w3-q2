@@ -209,8 +209,8 @@ async def _chat_json(user):
             break
         try:
             async with httpx.AsyncClient(timeout=left - 2) as c:
-                # Use x-goog-api-key header for the new AQ. keys
-                r = await c.post(url, json=body, headers={"x-goog-api-key": LLM_API_KEY})
+                # Use Authorization: Bearer for AQ. OAuth keys
+                r = await c.post(url, json=body, headers={"Authorization": f"Bearer {LLM_API_KEY}"})
             if r.status_code in (429, 500, 502, 503, 504):
                 last = f"http {r.status_code}"
                 await asyncio.sleep(1.5)
